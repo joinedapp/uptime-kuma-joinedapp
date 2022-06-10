@@ -16,6 +16,7 @@ const { demoMode } = require("../config");
 const version = require("../../package.json").version;
 const apicache = require("../modules/apicache");
 const { UptimeKumaServer } = require("../uptime-kuma-server");
+const request = require("request");
 
 /**
  * status:
@@ -160,6 +161,8 @@ class Monitor extends BeanModel {
     start(io) {
         let previousBeat = null;
         let retries = 0;
+
+        let errorReq = false;
 
         let prometheus = new Prometheus(this);
 
@@ -312,11 +315,7 @@ class Monitor extends BeanModel {
                             bean.msg += ", keyword is found";
                             bean.status = UP;
                         } else {
-                            data = data.replace(/<[^>]*>?|[\n\r]|\s+/gm, " ");
-                            if (data.length > 50) {
-                                data = data.substring(0, 47) + "...";
-                            }
-                            throw new Error(bean.msg + ", but keyword is not in [" + data + "]");
+                            throw new Error(bean.msg + ", but keyword is not found");
                         }
 
                     }
@@ -463,6 +462,7 @@ class Monitor extends BeanModel {
                 retries = 0;
 
             } catch (error) {
+                errorReq = true;
 
                 bean.msg = error.message;
 
@@ -485,8 +485,27 @@ class Monitor extends BeanModel {
             if (isImportant) {
                 bean.important = true;
 
+                let basicAuthHeader = {};
+                if (this.basic_auth_user) {
+                    basicAuthHeader = {
+                        "Authorization": "Basic " + this.encodeBase64(this.basic_auth_user, this.basic_auth_pass),
+                    };
+                }
+                const options = {
+                    url: this.url,
+                    method: (this.method || "get").toLowerCase(),
+                    ...(this.body ? { data: JSON.parse(this.body) } : {}),
+                    timeout: this.interval * 1000 * 0.8,
+                    headers: {
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
+                        "User-Agent": "Uptime-Kuma/" + version,
+                        ...(this.headers ? JSON.parse(this.headers) : {}),
+                        ...(basicAuthHeader),
+                    },
+                };
+
                 log.debug("monitor", `[${this.name}] sendNotification`);
-                await Monitor.sendNotification(isFirstBeat, this, bean);
+                await Monitor.sendNotification(isFirstBeat, this, bean, errorReq, options);
 
                 // Clear Status Page Cache
                 log.debug("monitor", `[${this.name}] apicache clear`);
@@ -797,7 +816,7 @@ class Monitor extends BeanModel {
      * @param {Monitor} monitor The monitor to send a notificaton about
      * @param {Bean} bean Status information about monitor
      */
-    static async sendNotification(isFirstBeat, monitor, bean) {
+    static async sendNotification(isFirstBeat, monitor, bean, errorReq = false, options = {}) {
         if (!isFirstBeat || bean.status === DOWN) {
             const notificationList = await Monitor.getNotificationList(monitor);
 
@@ -808,16 +827,48 @@ class Monitor extends BeanModel {
                 text = "🔴 Down";
             }
 
-            let msg = `[${monitor.name}] [${text}] ${bean.msg}`;
-
-            for (let notification of notificationList) {
+            if (errorReq) {
                 try {
-                    await Notification.send(JSON.parse(notification.config), msg, await monitor.toJSON(false), bean.toJSON());
+                    await request(options, function (err, res, body) {
+                        if (err)
+                            log.error("monitor", err);
+
+                        const resBody = body ? `\n\n*Response* \n${body}` : "";
+                        const reqUrl = options.url ? `\n\n*Request URL [${options.method.toUpperCase()}]* \n ${options.url}` : "";
+                        let msg = `[${monitor.name}] [${text}] ${bean.msg} ${reqUrl} ${resBody}`;
+                        for (let notification of notificationList) {
+                            try {
+                                Notification.send(JSON.parse(notification.config), msg, false, bean.toJSON());
+                            } catch (e) {
+                                log.error("monitor", "Cannot send notification to " + notification.name);
+                                log.error("monitor", e);
+                            }
+                        } 
+                    });
                 } catch (e) {
-                    log.error("monitor", "Cannot send notification to " + notification.name);
-                    log.error("monitor", e);
+                    let msg = `[${monitor.name}] [${text}] ${bean.msg}`;
+                    for (let notification of notificationList) {
+                        try {
+                            await Notification.send(JSON.parse(notification.config), msg, await monitor.toJSON(false), bean.toJSON());
+                        } catch (e) {
+                            log.error("monitor", "Cannot send notification to " + notification.name);
+                            log.error("monitor", e);
+                        }
+                    }   
                 }
+            } else {
+                let msg = `[${monitor.name}] [${text}] ${bean.msg}`;
+
+                for (let notification of notificationList) {
+                    try {
+                        await Notification.send(JSON.parse(notification.config), msg, await monitor.toJSON(false), bean.toJSON());
+                    } catch (e) {
+                        log.error("monitor", "Cannot send notification to " + notification.name);
+                        log.error("monitor", e);
+                    }
+                }   
             }
+
         }
     }
 
